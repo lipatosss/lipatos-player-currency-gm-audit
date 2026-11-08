@@ -1,0 +1,55 @@
+name: Publish Foundry VTT module
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lipatos-player-currency-gm-audit.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Unpack module source into repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/lipatos-module
+          unzip -oq lipatos-player-currency-gm-audit.zip -d /tmp/lipatos-module
+          cp /tmp/lipatos-module/lipatos-player-currency-gm-audit/{main.js,style.css,README.md,CHANGELOG.md,module.json} .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.js style.css README.md CHANGELOG.md module.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync source files for Foundry module release"
+            git push origin HEAD:main
+          fi
+
+      - name: Publish versioned GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./module.json').version")
+          tag="v${version}"
+          asset="lipatos-player-currency-gm-audit.zip"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${asset}" --clobber
+          else
+            gh release create "${tag}" "${asset}" \
+              --title "LipatoS — Аудит валюты и предметов ${tag}" \
+              --notes "Релиз модуля LipatoS для Foundry VTT. Установка через module.json в ветке main." \
+              --target main \
+              --latest
+          fi
