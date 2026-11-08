@@ -1,0 +1,1408 @@
+const MODULE_ID = "lipatos-player-currency-gm-audit";
+const LEGACY_SOCKET = "module.player-currency-gm-audit";
+const SOCKET = `module.${MODULE_ID}`;
+
+const LABELS = {
+  pp: "платины",
+  gp: "золота",
+  ep: "электрума",
+  sp: "серебра",
+  cp: "меди"
+};
+
+function gmIds() {
+  return game.users.filter(u => u.isGM).map(u => u.id);
+}
+
+function primaryActiveGM() {
+  return game.users
+    .filter(u => u.isGM && u.active)
+    .sort((a, b) => a.id.localeCompare(b.id))[0] ?? null;
+}
+
+function normalizeAmounts(amounts = {}) {
+  const out = {};
+  for (const key of Object.keys(CONFIG.DND5E.currencies ?? {})) {
+    const value = Math.max(0, Number(amounts[key] ?? 0) || 0);
+    if (value > 0) out[key] = value;
+  }
+  return out;
+}
+
+function formatAmounts(amounts = {}) {
+  const entries = Object.entries(normalizeAmounts(amounts));
+  if (!entries.length) return "0";
+  return entries
+    .map(([key, value]) => `<strong>${value}</strong> ${LABELS[key] ?? key}`)
+    .join(", ");
+}
+
+function docName(doc) {
+  if (!doc) return "неизвестно";
+  if (doc.documentName === "Item" && doc.parent) return `${doc.parent.name} → ${doc.name}`;
+  return doc.name ?? "неизвестно";
+}
+
+function destinationName(destinations, {toGM = false} = {}) {
+  if (toGM) return "ГМ";
+
+  const names = (destinations ?? [])
+    .map(d => docName(d))
+    .filter(Boolean);
+
+  return names.length ? names.join(", ") : "неизвестный получатель";
+}
+
+async function playerConfirmation(destinations, amounts, {toGM = false} = {}) {
+  if (game.user.isGM) return;
+
+  const destination = foundry.utils.escapeHTML(destinationName(destinations, {toGM}));
+  const money = formatAmounts(amounts);
+
+  const content = `
+    <div class="pcga-player-confirm">
+      <div>🪙 <strong>Передача денег</strong></div>
+      <div>Вы передали <strong>→ [ ${destination} ]</strong></div>
+      <div>Монеты: ${money}</div>
+      <div><strong>Успешно передано ✓</strong></div>
+    </div>`;
+
+  await ChatMessage.create({
+    content,
+    whisper: [game.user.id],
+    speaker: ChatMessage.getSpeaker()
+  });
+}
+
+async function createGMAuditMessage(payload) {
+  if (!game.user.isGM) return;
+
+  const primaryGM = primaryActiveGM();
+  if (primaryGM && primaryGM.id !== game.user.id) return;
+
+  const {
+    actorUuid,
+    actorName,
+    destinationNames = [],
+    amounts = {},
+    toGM = false
+  } = payload ?? {};
+
+  let actor = null;
+  if (actorUuid) {
+    try {
+      actor = await fromUuid(actorUuid);
+      if (actor?.documentName === "Item") actor = actor.parent;
+    } catch (_) {}
+  }
+
+  const who = foundry.utils.escapeHTML(actor?.name ?? actorName ?? "Игрок");
+  const money = formatAmounts(amounts);
+
+  let destinationText;
+  if (toGM) {
+    destinationText = "<strong>ГМу</strong>";
+  } else {
+    const safeNames = destinationNames.map(n => `<strong>${foundry.utils.escapeHTML(n)}</strong>`);
+    destinationText = safeNames.length ? safeNames.join(", ") : "<strong>неизвестному получателю</strong>";
+  }
+
+  // IMPORTANT:
+  // This message is created by the GM client itself and whispered only to that GM.
+  // Do not use blind mode: in Foundry that can render the GM's own message as hidden/???.
+  const cleanDestination = destinationText.replace(/<\?strong>/g, "");
+  const cleanMoney = money.replace(/<\?strong>/g, "");
+
+  const content = `
+    <div class="pcga-chat-log">
+      🪙 <strong>Передача денег</strong><br>
+      ${who} <strong>→ [ ${cleanDestination} ]</strong><br>
+      Монеты: <strong>${cleanMoney}</strong><br>
+      <strong>Передача выполнена ✓</strong>
+    </div>`;
+
+  await ChatMessage.create({
+    content,
+    whisper: [game.user.id],
+    speaker: actor?.documentName === "Actor"
+      ? ChatMessage.getSpeaker({actor})
+      : ChatMessage.getSpeaker()
+  });
+}
+
+function sendAuditToGM(origin, destinations, amounts, {toGM = false} = {}) {
+  if (game.user.isGM) return;
+
+  const actor = origin?.documentName === "Actor" ? origin : origin?.parent;
+  const destinationNames = (destinations ?? []).map(d => docName(d));
+
+  game.socket.emit(SOCKET, {
+    type: "audit",
+    actorUuid: actor?.uuid ?? null,
+    actorName: actor?.name ?? game.user.name,
+    destinationNames,
+    amounts: normalizeAmounts(amounts),
+    toGM
+  });
+}
+
+function readAmounts(app) {
+  const amounts = {};
+  for (const key of Object.keys(CONFIG.DND5E.currencies ?? {})) {
+    const input = app.element?.querySelector?.(`[name="amount.${key}"]`);
+    amounts[key] = Math.max(0, Number(input?.value ?? 0) || 0);
+  }
+  return normalizeAmounts(amounts);
+}
+
+function currencyOwnerDocument(app) {
+  return app.document ?? app.options?.document ?? null;
+}
+
+async function sendToGM(app) {
+  if (game.user.isGM) return;
+
+  const doc = currencyOwnerDocument(app);
+  if (!doc?.system?.currency) {
+    ui.notifications.warn("Не удалось определить кошелёк.");
+    return;
+  }
+
+  const amounts = readAmounts(app);
+  if (!Object.keys(amounts).length) {
+    ui.notifications.warn("Укажи количество денег для передачи ГМу.");
+    return;
+  }
+
+  for (const [key, amount] of Object.entries(amounts)) {
+    const current = Number(doc.system.currency[key] ?? 0) || 0;
+    if (amount > current) {
+      ui.notifications.warn(`Недостаточно валюты: ${key.toUpperCase()}.`);
+      return;
+    }
+  }
+
+  const updates = {};
+  for (const [key, amount] of Object.entries(amounts)) {
+    const current = Number(doc.system.currency[key] ?? 0) || 0;
+    updates[`system.currency.${key}`] = current - amount;
+  }
+
+  try {
+    await doc.update(updates, {[MODULE_ID]: {toGM: true}});
+
+    sendAuditToGM(doc, [], amounts, {toGM: true});
+    await playerConfirmation([], amounts, {toGM: true});
+
+    ui.notifications.info("Деньги переданы ГМу.");
+    app.close();
+  } catch (err) {
+    console.error(`${MODULE_ID} | Send to GM failed`, err);
+    ui.notifications.error("Не удалось передать деньги ГМу. Смотри консоль F12.");
+  }
+}
+
+
+function pcgaGroupHasMember(group, actor) {
+  if (group?.type !== "group" || !actor) return false;
+  const members = group.system?.members;
+  if (members?.ids?.has?.(actor.id)) return true;
+  return Array.from(members ?? []).some(member => {
+    const value = member?.actor ?? member;
+    return value === actor.id || value === actor.uuid
+      || value?.id === actor.id || value?.uuid === actor.uuid;
+  });
+}
+
+function pcgaTransferRecipients(originActor) {
+  const sourceActor = originActor?.documentName === "Actor" ? originActor : originActor?.parent;
+  const result = [];
+  if (primaryActiveGM() || game.user?.isGM) result.push({id: "__GM__", name: "ГМ", type: "gm"});
+
+  if (sourceActor?.type === "character") {
+    for (const group of game.actors.filter(actor => actor.type === "group")) {
+      if (pcgaGroupHasMember(group, sourceActor)) {
+        result.push({id: group.id, name: group.name, type: "group"});
+      }
+    }
+  }
+
+  const seen = new Set([sourceActor?.id]);
+  for (const user of game.users) {
+    if (!user.active || user.isGM) continue;
+    const character = user.character;
+    if (character?.type !== "character" || seen.has(character.id)) continue;
+    if (!game.actors.get(character.id)) continue;
+    seen.add(character.id);
+    result.push({id: character.id, name: character.name, type: "character"});
+  }
+
+  return result.sort((a, b) => {
+    if (a.type === "gm") return -1;
+    if (b.type === "gm") return 1;
+    if (a.type === "group" && b.type !== "group") return -1;
+    if (b.type === "group" && a.type !== "group") return 1;
+    return a.name.localeCompare(b.name, game.i18n.lang);
+  });
+}
+
+
+function pcgaValidateWalletAmounts(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const entries = Object.entries(raw);
+  if (!entries.length) return null;
+  const result = {};
+  for (const [coin, amount] of entries) {
+    if (!["cp", "sp", "gp"].includes(coin) || !Number.isSafeInteger(amount) || amount < 1) return null;
+    result[coin] = amount;
+  }
+  return result;
+}
+
+// One authoritative currency transaction. A GM (or the owner of both wallets)
+// executes it immediately; a transfer across ownership boundaries is
+// automatically applied by an online GM, without a confirmation request.
+async function pcgaGMRemoteCurrency(payload, {local = false} = {}) {
+  if (!local && !game.user.isGM) return;
+  const primary = primaryActiveGM();
+  if (!local && (!primary || primary.id !== game.user.id)) return;
+
+  const reply = (ok, extra = {}) => {
+    const response = {
+      type: "remote-currency-result",
+      requestId: payload?.requestId,
+      requesterId: payload?.requesterId,
+      ok, ...extra
+    };
+    if (!local) game.socket.emit(SOCKET, response);
+    return response;
+  };
+
+  const requester = game.users.get(payload?.requesterId);
+  const origin = payload?.originActorUuid
+    ? await fromUuid(payload.originActorUuid).catch(() => null) : null;
+  const owner = origin?.documentName === "Actor" ? origin : origin?.parent;
+  if (!requester?.active || !origin?.system?.currency || !owner ||
+      !owner.testUserPermission?.(requester, "OWNER") ||
+      (local && !game.user.isGM && game.user.id !== requester.id)) {
+    return reply(false, {error: "Кошелёк отправителя недоступен или нет прав."});
+  }
+
+  if (!pcgaTransferRecipients(owner).some(r => r.id === payload?.targetActorId)) {
+    return reply(false, {error: "Получатель не в сети или группа недоступна."});
+  }
+
+  const amounts = pcgaValidateWalletAmounts(payload?.amounts);
+  if (!amounts) return reply(false, {error: "Укажите целое положительное количество монет."});
+
+  const targetId = payload.targetActorId;
+  const target = targetId === "__GM__" ? null : game.actors.get(targetId);
+  if (targetId !== "__GM__" && !target?.system?.currency) {
+    return reply(false, {error: "Кошелёк получателя недоступен."});
+  }
+  if (local && !game.user.isGM && (targetId === "__GM__" || !target.isOwner)) {
+    return reply(false, {error: "Для передачи этому получателю требуется подключённый ГМ."});
+  }
+
+  const originUpdate = {};
+  const originRestore = {};
+  const targetUpdate = {};
+  for (const [key, qty] of Object.entries(amounts)) {
+    const previous = Number(origin.system.currency[key]);
+    if (!Number.isSafeInteger(previous) || previous < qty) {
+      return reply(false, {error: `Недостаточно валюты: ${key.toUpperCase()}.`});
+    }
+    originUpdate[`system.currency.${key}`] = previous - qty;
+    originRestore[`system.currency.${key}`] = previous;
+    if (target) {
+      const current = Number(target.system.currency[key]);
+      if (!Number.isSafeInteger(current) || current < 0 ||
+          !Number.isSafeInteger(current + qty)) {
+        return reply(false, {error: "Некорректный баланс получателя."});
+      }
+      targetUpdate[`system.currency.${key}`] = current + qty;
+    }
+  }
+
+  try {
+    await origin.update(originUpdate, {[MODULE_ID]: {walletTransfer: true}});
+    try {
+      if (target) await target.update(targetUpdate, {[MODULE_ID]: {walletTransfer: true}});
+    } catch (err) {
+      // Never silently keep the sender's deduction after crediting fails.
+      try {
+        await origin.update(originRestore, {[MODULE_ID]: {walletTransfer: true}});
+      } catch (rollbackError) {
+        console.error(`${MODULE_ID} | Wallet transfer rollback failed`, rollbackError);
+      }
+      throw err;
+    }
+    return reply(true, {
+      targetActorId: target?.id ?? "__GM__",
+      targetName: target?.name ?? "ГМ"
+    });
+  } catch (error) {
+    console.error(`${MODULE_ID} | Wallet transfer failed`, error);
+    return reply(false, {error: "Передача монет не выполнена. Баланс необходимо проверить."});
+  }
+}
+
+async function pcgaRequestCurrencyTransfer(origin, target, amounts) {
+  const requestId = foundry.utils.randomID();
+  const payload = {
+    type: "remote-currency-request",
+    requestId,
+    requesterId: game.user.id,
+    originActorUuid: origin.uuid,
+    targetActorId: target.id,
+    amounts
+  };
+
+  // GM never sends a socket request to itself; owned-to-owned currency
+  // transfers are also direct, even when no GM is connected.
+  if (game.user.isGM) return pcgaGMRemoteCurrency(payload, {local: true});
+
+  const recipient = target.id === "__GM__" ? null : game.actors.get(target.id);
+  if (origin.isOwner && recipient?.isOwner) {
+    return pcgaGMRemoteCurrency(payload, {local: true});
+  }
+
+  if (!primaryActiveGM()) {
+    return {ok: false, error: "Для передачи этому получателю нужен подключённый ГМ."};
+  }
+
+  return new Promise(resolve => {
+    const socket = SOCKET;
+    let finished = false;
+    let timeout;
+    const finish = result => {
+      if (finished) return;
+      finished = true;
+      game.socket.off(socket, onResult);
+      clearTimeout(timeout);
+      resolve(result);
+    };
+    const onResult = result => {
+      if (result?.type !== "remote-currency-result" ||
+          result.requestId !== requestId || result.requesterId !== game.user.id) return;
+      finish(result);
+    };
+    game.socket.on(socket, onResult);
+    timeout = setTimeout(() => {
+      finish({ok: false, error: "Не удалось выполнить передачу. Проверьте подключение и попробуйте ещё раз."});
+    }, 15000);
+    try {
+      game.socket.emit(socket, payload);
+    } catch (err) {
+      console.error(`${MODULE_ID} | Wallet transfer socket failed`, err);
+      finish({ok: false, error: "Не удалось выполнить передачу из-за ошибки соединения."});
+    }
+  });
+}
+
+async function pcgaConfirmCurrencyTransfer(origin, target, amounts) {
+  const response = await pcgaRequestCurrencyTransfer(origin, target, amounts);
+  if (!response?.ok) {
+    ui.notifications.warn(response?.error ?? "Не удалось передать деньги.");
+    return false;
+  }
+
+  if (!game.user.isGM) {
+    const toGM = target.id === "__GM__";
+    const destination = toGM ? [] : [game.actors.get(target.id)].filter(Boolean);
+    sendAuditToGM(origin, destination, amounts, {toGM});
+    await playerConfirmation(destination, amounts, {toGM});
+  }
+
+  ui.notifications.info("Монеты переданы.");
+  return true;
+}
+
+async function pcgaOpenPlayerTransferDialog(app) {
+  const origin = currencyOwnerDocument(app);
+  const recipients = pcgaTransferRecipients(origin);
+
+  if (!recipients.length) {
+    ui.notifications.warn("Нет доступных получателей.");
+    return;
+  }
+
+  const amounts = readAmounts(app);
+  if (!Object.keys(amounts).length) {
+    ui.notifications.warn("Сначала укажи сумму для передачи.");
+    return;
+  }
+
+  const DialogV2 = foundry.applications?.api?.DialogV2;
+  if (!DialogV2?.wait) return;
+
+  const options = recipients
+    .map((recipient, index) => `<option value="${index}">${foundry.utils.escapeHTML(recipient.name)}</option>`)
+    .join("");
+
+  const selectedIndex = await DialogV2.wait({
+    window: {title: "Выбор игрока"},
+    modal: true,
+    content: `
+      <div class="standard-form pcga-recipient-dialog">
+        <div class="form-group">
+          <label>Кому передать</label>
+          <div class="form-fields">
+            <select name="recipient">${options}</select>
+          </div>
+        </div>
+      </div>`,
+    buttons: [
+      {
+        action: "confirm",
+        label: "Подтвердить",
+        default: true,
+        callback: async (event, button) => {
+          const value = Number(button.form?.elements?.recipient?.value);
+          return Number.isInteger(value) ? value : null;
+        }
+      },
+      {
+        action: "cancel",
+        label: "Отмена",
+        callback: async () => null
+      }
+    ],
+    close: () => null
+  });
+
+  if (selectedIndex == null || !recipients[selectedIndex]) return;
+  const target = recipients[selectedIndex];
+  if (!pcgaTransferRecipients(origin).some(recipient => recipient.id === target.id)) {
+    ui.notifications.warn("Получатель больше не в сети или группа недоступна.");
+    return;
+  }
+  const success = await pcgaConfirmCurrencyTransfer(origin, target, amounts);
+  if (success) app.close();
+}
+
+function pcgaWalletCoinFromLabel(label) {
+  // LipatoS Three Currencies replaces the native i.currency with a draggable
+  // img.currency. Read the denomination from the real D&D5e wallet input,
+  // never from an icon tag or its styling.
+  if (!label?.querySelector) return null;
+  const input = label.querySelector('input[name^="system.currency."]');
+  const name = String(input?.name ?? input?.getAttribute?.("name") ?? "");
+  const code = /^system\.currency\.(cp|sp|gp)$/.exec(name)?.[1];
+  if (!code) return null;
+
+  // Currency prices in item rows are not wallet denominations. Restrict
+  // this menu to the actor wallet of the actual D&D5e inventory component.
+  const section = label.closest?.("section.currency");
+  const inventory = section?.closest?.("dnd5e-inventory");
+  if (!section || !inventory) return null;
+
+  const source = inventory.document ?? inventory.actor ?? inventory.app?.actor;
+  let actor = source?.documentName === "Actor" ? source : source?.actor;
+
+  // The Three Currencies module stores the precise actor UUID on its
+  // replacement IMG. Fallback helps on linked/unlinked token sheets.
+  if (!actor?.system?.currency) {
+    const icon = label.querySelector('img.lipatos-currency-drag, img.currency');
+    const uuid = icon?.dataset?.actorUuid;
+    if (uuid) {
+      try {
+        const doc = globalThis.fromUuidSync?.(uuid)
+          ?? foundry.utils.fromUuidSync?.(uuid);
+        actor = doc?.documentName === "Actor" ? doc : doc?.actor;
+      } catch (error) {
+        console.warn(`${MODULE_ID} | Could not resolve coin wallet actor`, error);
+      }
+    }
+  }
+
+  if (!actor?.system?.currency || !["character", "group"].includes(actor.type)) return null;
+  return {actor, code};
+}
+
+async function pcgaOpenWalletTransferDialog(actor, code) {
+  if (!actor?.isOwner) {
+    ui.notifications.warn("Нет прав на передачу монет.");
+    return;
+  }
+  const maximum = Math.floor(Number(actor.system?.currency?.[code]));
+  if (!Number.isSafeInteger(maximum) || maximum < 1) {
+    ui.notifications.warn("Нет монет для передачи.");
+    return;
+  }
+  // The "ГМ" destination is valid even when the sender is currently the GM.
+  // It is an immediate transfer to the GM treasury, not a trade request.
+  const recipients = pcgaTransferRecipients(actor);
+  if (!recipients.length) {
+    ui.notifications.warn("Нет получателей онлайн или доступной группы.");
+    return;
+  }
+  const DialogV2 = foundry.applications?.api?.DialogV2;
+  if (!DialogV2?.wait) return;
+
+  const names = {cp: "Медь", sp: "Серебро", gp: "Золото"};
+  const uid = foundry.utils.randomID();
+  const selector = `.pcga-wallet-dialog-${uid}`;
+  const clamp = raw => {
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) ? Math.max(1, Math.min(maximum, n)) : 1;
+  };
+  const sync = event => {
+    const root = event.target?.closest?.(selector);
+    if (!root) return;
+    if (!event.target.matches('input[name="quantity"], input[name="quantitySlider"]')) return;
+    const number = root.querySelector('input[name="quantity"]');
+    const slider = root.querySelector('input[name="quantitySlider"]');
+    if (!number || !slider || (event.type === "input" && number === event.target && number.value === "")) return;
+    const value = clamp(event.target.value);
+    number.value = String(value);
+    slider.value = String(value);
+  };
+  document.addEventListener("input", sync, true);
+  document.addEventListener("change", sync, true);
+
+  const options = recipients.map((recipient, index) =>
+    `<option value="${index}">${foundry.utils.escapeHTML(recipient.name)}</option>`
+  ).join("");
+
+  try {
+    const selected = await DialogV2.wait({
+      window: {title: "Передать предмет"},
+      modal: true,
+      content: `
+        <div class="standard-form pcga-wallet-transfer-dialog pcga-wallet-dialog-${uid}">
+          <div class="pcga-wallet-transfer-heading">
+            <i class="currency ${code}" aria-hidden="true"></i>
+            <div><strong>${names[code]}</strong><span>Доступно: ${maximum}</span></div>
+          </div>
+          <div class="form-group">
+            <label>Кому передать</label>
+            <div class="form-fields"><select name="recipient">${options}</select></div>
+          </div>
+          <div class="form-group">
+            <label>Количество</label>
+            <div class="form-fields pcga-wallet-transfer-quantity">
+              <input name="quantitySlider" type="range" min="1" max="${maximum}" step="1" value="${maximum}">
+              <input name="quantity" type="number" min="1" max="${maximum}" step="1" value="${maximum}">
+            </div>
+          </div>
+        </div>`,
+      buttons: [
+        {
+          action: "confirm", label: "Подтвердить", default: true,
+          callback: (_event, button) => {
+            const index = Number(button.form?.elements?.recipient?.value);
+            const amount = Number(button.form?.elements?.quantity?.value);
+            if (!Number.isSafeInteger(index) || !recipients[index] ||
+                !Number.isSafeInteger(amount) || amount < 1 || amount > maximum) {
+              ui.notifications.warn("Выберите получателя и корректное количество монет.");
+              return null;
+            }
+            return {index, amount};
+          }
+        },
+        {action: "cancel", label: "Отмена", callback: () => null}
+      ],
+      close: () => null
+    });
+    if (!selected) return;
+
+    const recipient = recipients[selected.index];
+    if (!recipient || !pcgaTransferRecipients(actor).some(r => r.id === recipient.id)) {
+      ui.notifications.warn("Получатель больше не в сети или группа недоступна.");
+      return;
+    }
+    await pcgaConfirmCurrencyTransfer(actor, recipient, {[code]: selected.amount});
+  } finally {
+    document.removeEventListener("input", sync, true);
+    document.removeEventListener("change", sync, true);
+  }
+}
+
+function pcgaInstallWalletContextMenu() {
+  let currentMenu = null;
+  let cleanup = null;
+  const close = () => {
+    if (cleanup) cleanup();
+    currentMenu?.remove();
+    currentMenu = null;
+    cleanup = null;
+  };
+
+  document.addEventListener("contextmenu", event => {
+    // Capture RMB over either the replacement coin IMG or its numeric input.
+    // Avoid a rigid direct-child selector; D&D5e sheets may wrap the wallet.
+    const label = event.target?.closest?.("label");
+
+    const currency = pcgaWalletCoinFromLabel(label);
+    if (!currency || !currency.actor.isOwner) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    close();
+
+    const menu = document.createElement("div");
+    menu.className = "pcga-wallet-context-menu";
+    menu.setAttribute("role", "menu");
+    // Do not use a BUTTON here: D&D5e global button styles turn its
+    // background white with nearly invisible text on dark actor sheets.
+    // A focusable menu item uses our own Foundry-like context styling.
+    const transfer = document.createElement("div");
+    transfer.className = "pcga-wallet-context-item";
+    transfer.setAttribute("role", "menuitem");
+    transfer.setAttribute("tabindex", "0");
+    transfer.innerHTML = '<i class="fa-solid fa-hand-holding" aria-hidden="true"></i><span>Передать предмет</span>';
+    menu.appendChild(transfer);
+    document.body.appendChild(menu);
+    currentMenu = menu;
+
+    const x = Math.max(0, Math.min(event.clientX, window.innerWidth - menu.offsetWidth - 8));
+    const y = Math.max(0, Math.min(event.clientY, window.innerHeight - menu.offsetHeight - 8));
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+
+    const executeTransfer = e => {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+      void pcgaOpenWalletTransferDialog(currency.actor, currency.code);
+    };
+    transfer.addEventListener("click", executeTransfer);
+    transfer.addEventListener("keydown", e => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      executeTransfer(e);
+    });
+
+    const onOutside = e => { if (!menu.contains(e.target)) close(); };
+    const onEscape = e => { if (e.key === "Escape") close(); };
+    document.addEventListener("pointerdown", onOutside, true);
+    document.addEventListener("keydown", onEscape, true);
+    cleanup = () => {
+      document.removeEventListener("pointerdown", onOutside, true);
+      document.removeEventListener("keydown", onEscape, true);
+    };
+    transfer.focus();
+  }, true);
+}
+
+function injectSendToGM(app) {
+  if (game.user.isGM) return;
+  const root = app.element;
+  if (!root?.classList?.contains("currency-manager")) return;
+
+  const transferButton = root.querySelector('button[name="transfer"]');
+  if (!transferButton) return;
+
+  // Убираем штатные цели передачи с основной панели.
+  // Теперь ЛЮБОЙ получатель выбирается только через наше окно "Выбор игрока".
+  // Это касается и "Группа", и строк персонажей (например TEST2) на листе Группы.
+  const nativeTargetInputs = root.querySelectorAll(
+    'input[type="checkbox"][name], input[type="radio"][name]'
+  );
+
+  for (const input of nativeTargetInputs) {
+    const name = String(input.name ?? "").toLowerCase();
+    const value = String(input.value ?? "").toLowerCase();
+
+    // Не трогаем системные элементы окна, если они не похожи на получателя.
+    const row = input.closest("label, .form-group, .checkbox, .transfer-target");
+    if (!row) continue;
+
+    const text = String(row.textContent ?? "").trim();
+
+    const looksLikeRecipient =
+      name.includes("group") ||
+      name.includes("party") ||
+      name.includes("recipient") ||
+      name.includes("target") ||
+      value === "group" ||
+      text === "Группа" ||
+      // В Group Currency Manager штатный получатель отображается как имя Character Actor.
+      game.actors.some(a => a.type === "character" && a.name === text);
+
+    if (looksLikeRecipient) row.style.display = "none";
+  }
+
+  // Дополнительный проход по label — D&D5e 6 может рендерить цель без предсказуемого name.
+  const characterNames = new Set(
+    game.actors.filter(a => a.type === "character").map(a => a.name)
+  );
+
+  for (const el of root.querySelectorAll("label")) {
+    const text = String(el.textContent ?? "").trim();
+    if (text === "Группа" || characterNames.has(text)) {
+      el.style.display = "none";
+    }
+  }
+
+  // v25: exact D&D5e 6.x Currency Manager markup.
+  // Template: section[data-tab="transfer"] > section.currency > label,
+  // each label contains i.currency.<denomination>.
+  // Required order in TRANSFER panel: CP → GP → SP.
+  const transferCurrencySection =
+    root.querySelector('section[data-tab="transfer"] > section.currency');
+
+  if (transferCurrencySection) {
+    const labels = [...transferCurrencySection.querySelectorAll(':scope > label')];
+    const byKey = key => labels.find(label =>
+      label.querySelector(`:scope > i.currency.${key}`)
+    );
+
+    const cp = byKey("cp");
+    const gp = byKey("gp");
+    const sp = byKey("sp");
+
+    if (cp && gp && sp) {
+      // Keep "ВСЁ" and "ПОЛОВИНА" buttons untouched; only move currency labels.
+      transferCurrencySection.append(cp, gp, sp);
+    }
+  }
+
+  // Hide D&D5e's native "Передать выбранное".
+  transferButton.style.display = "none";
+
+  // Remove old buttons from previous versions if they exist.
+  root.querySelector(".pcga-send-gm")?.remove();
+  root.querySelector(".pcga-send-player")?.remove();
+
+  if (!root.querySelector(".pcga-choose-player")) {
+    const chooseButton = document.createElement("button");
+    chooseButton.type = "button";
+    chooseButton.className = "pcga-choose-player";
+    chooseButton.textContent = "Выбор игрока";
+
+    chooseButton.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      pcgaOpenPlayerTransferDialog(app);
+    });
+
+    transferButton.insertAdjacentElement("afterend", chooseButton);
+  }
+}
+
+/* ============================================================
+ * v8: Item movement / deletion audit
+ * - handles both new-item transfers and stacking into an existing item
+ * - player gets a local confirmation
+ * - GM gets a private audit through module socket
+ * ============================================================ */
+
+const RECENT_ITEM_DESTINATIONS = [];
+const ITEM_PAIR_WINDOW_MS = 3000;
+const PENDING_ITEM_DELETIONS = new Map();
+
+// Deleting the final charge/portion or the final piece of ammunition is
+// consumption, not a manual inventory deletion. Mark only the specific
+// actor-owned item that D&D5e is actually consuming.
+const PCGA_CONSUMPTION_WINDOW_MS = 30000;
+const PCGA_CONSUMED_ITEM_KEYS = new Map();
+
+function pcgaConsumptionKey(actor, itemId) {
+  if (!actor?.uuid || !itemId) return null;
+  return `${actor.uuid}|${itemId}`;
+}
+
+function pcgaMarkConsumedItem(actor, itemId) {
+  const key = pcgaConsumptionKey(actor, itemId);
+  if (!key) return;
+  PCGA_CONSUMED_ITEM_KEYS.set(key, Date.now());
+}
+
+function pcgaForgetConsumedItem(actor, itemId) {
+  const key = pcgaConsumptionKey(actor, itemId);
+  if (key) PCGA_CONSUMED_ITEM_KEYS.delete(key);
+}
+
+function pcgaIsConsumptionDeletion(item, options) {
+  if (options?.lipatosItemConsumed || options?.itemMoveStackUse) return true;
+  const key = pcgaConsumptionKey(item?.parent, item?.id);
+  if (!key) return false;
+  const markedAt = PCGA_CONSUMED_ITEM_KEYS.get(key);
+  if (markedAt === undefined) return false;
+  PCGA_CONSUMED_ITEM_KEYS.delete(key);
+  return Date.now() - markedAt <= PCGA_CONSUMPTION_WINDOW_MS;
+}
+
+function pcgaConsumptionDeletedIds(updates) {
+  return (Array.isArray(updates?.delete) ? updates.delete : [])
+    .map(entry => typeof entry === "string" ? entry : entry?._id ?? entry?.id)
+    .filter(Boolean);
+}
+const ITEM_PILES_TRADE_HOOK = "item-piles-tradeComplete";
+
+function itemQuantity(item) {
+  const q = Number(item?.system?.quantity ?? 1);
+  return Number.isFinite(q) ? q : 1;
+}
+
+function itemIdentity(item) {
+  return [
+    String(item?.type ?? ""),
+    String(item?.name ?? "").trim().toLowerCase(),
+    String(item?.system?.identifier ?? "").trim().toLowerCase()
+  ].join("|");
+}
+
+function pruneItemDestinations() {
+  const now = Date.now();
+  for (let i = RECENT_ITEM_DESTINATIONS.length - 1; i >= 0; i--) {
+    if (now - RECENT_ITEM_DESTINATIONS[i].time > ITEM_PAIR_WINDOW_MS) {
+      RECENT_ITEM_DESTINATIONS.splice(i, 1);
+    }
+  }
+}
+
+function rememberItemDestination(item, quantity, userId) {
+  if (game.user.isGM) return;
+  if (userId && userId !== game.user.id) return;
+  if (item?.parent?.documentName !== "Actor") return;
+
+  quantity = Math.max(1, Number(quantity) || 1);
+  pruneItemDestinations();
+
+  RECENT_ITEM_DESTINATIONS.push({
+    identity: itemIdentity(item),
+    targetActorUuid: item.parent.uuid,
+    targetActorName: item.parent.name,
+    targetActorType: item.parent.type,
+    itemName: item.name,
+    itemImg: item.img,
+    quantity,
+    time: Date.now()
+  });
+}
+
+function takeMatchingDestination(item) {
+  pruneItemDestinations();
+
+  const identity = itemIdentity(item);
+  const sourceQty = Math.max(1, itemQuantity(item));
+
+  // Prefer exact quantity, then any matching recent destination.
+  let index = RECENT_ITEM_DESTINATIONS.findIndex(entry =>
+    entry.identity === identity &&
+    entry.targetActorUuid !== item?.parent?.uuid &&
+    entry.quantity === sourceQty
+  );
+
+  if (index < 0) {
+    index = RECENT_ITEM_DESTINATIONS.findIndex(entry =>
+      entry.identity === identity &&
+      entry.targetActorUuid !== item?.parent?.uuid
+    );
+  }
+
+  if (index < 0) return null;
+  return RECENT_ITEM_DESTINATIONS.splice(index, 1)[0];
+}
+
+function sendItemAuditToGM(payload) {
+  if (game.user.isGM) return;
+  game.socket.emit(SOCKET, {
+    type: "item-audit",
+    ...payload
+  });
+}
+
+async function playerItemConfirmation(payload) {
+  if (game.user.isGM) return;
+
+  const action = payload?.action === "delete" ? "Удаление предмета" : "Передача предмета";
+  const success = payload?.action === "delete" ? "Успешно удалено ✓" : "Успешно передано ✓";
+
+  const target = foundry.utils.escapeHTML(payload?.targetActorName ?? "");
+  const itemName = foundry.utils.escapeHTML(payload?.itemName ?? "Предмет");
+  const img = foundry.utils.escapeHTML(payload?.itemImg ?? "icons/svg/item-bag.svg");
+  const qty = Math.max(1, Number(payload?.quantity ?? 1) || 1);
+
+  const sourceType = String(payload?.sourceActorType ?? "").toLowerCase();
+  const targetType = String(payload?.targetActorType ?? "").toLowerCase();
+  const sourceName = foundry.utils.escapeHTML(payload?.sourceActorName ?? "");
+
+  const route = payload?.action === "delete"
+    ? ""
+    : sourceType === "group" && targetType !== "group"
+      ? `Вы взяли ← [ <strong>${sourceName}</strong> ]<br>`
+      : `Вы передали → [ <strong>${target}</strong> ]<br>`;
+
+  const heading = payload?.action === "delete"
+    ? `❌ <strong>Удаление предмета</strong>`
+    : `📦 <strong>Передача предмета</strong>`;
+
+  const content = `
+    <div class="pcga-item-audit">
+      ${heading}<br>
+      ${route}
+      <div class="pcga-item-line">
+        <img src="${img}" alt="${itemName}">
+        <span>${itemName}${qty > 1 ? ` × <strong>${qty}</strong>` : ""}</span>
+      </div>
+      <strong>${success}</strong>
+    </div>`;
+
+  await ChatMessage.create({
+    content,
+    whisper: [game.user.id],
+    speaker: ChatMessage.getSpeaker()
+  });
+}
+
+async function createGMItemAuditMessage(payload) {
+  if (!game.user.isGM) return;
+
+  if (payload?.action === "trade-summary") {
+    const primaryGM = primaryActiveGM();
+    if (primaryGM && primaryGM.id !== game.user.id) return;
+    const hasMoney=m=>m&&(m.gp||m.sp||m.cp);
+    const moneyLine=m=>{if(!hasMoney(m))return"";const a=[];if(m.gp)a.push(`<strong>${m.gp}</strong> золота`);if(m.sp)a.push(`<strong>${m.sp}</strong> серебра`);if(m.cp)a.push(`<strong>${m.cp}</strong> меди`);return `<div class="pcga-trade-money">Монеты: ${a.join(", ")}</div>`;};
+    const section=(title,rows=[],money={})=>(rows.length||hasMoney(money))?`<div class="pcga-trade-section"><strong>${title}</strong>${rows.map(r=>`<div class="pcga-item-line"><img src="${foundry.utils.escapeHTML(r.img??"icons/svg/item-bag.svg")}" alt=""><span>${foundry.utils.escapeHTML(r.name??"Предмет")}${Number(r.qty)>1?` × <strong>${Number(r.qty)}</strong>`:""}</span></div>`).join("")}${moneyLine(money)}</div>`:"";
+    const content=`<div class="pcga-item-audit pcga-trade-audit"><strong>⇄ Обмен</strong><br><strong>[ ${foundry.utils.escapeHTML(payload.sourceActorName??"Игрок")} ]</strong>${section("Отдал:",payload.gave,payload.gaveMoney)}${section("Получил:",payload.got,payload.gotMoney)}</div>`;
+    await ChatMessage.create({content,whisper:[game.user.id],speaker:ChatMessage.getSpeaker()});
+    return;
+  }
+
+  const primaryGM = primaryActiveGM();
+  if (primaryGM && primaryGM.id !== game.user.id) return;
+
+  const action = payload?.action === "delete" ? "Удаление предмета" : "Передача предмета";
+  const success = payload?.action === "delete" ? "Успешно удалено ✓" : "Успешно передано ✓";
+
+  const actorName = foundry.utils.escapeHTML(payload?.sourceActorName ?? "Игрок");
+  const targetName = foundry.utils.escapeHTML(payload?.targetActorName ?? "");
+  const itemName = foundry.utils.escapeHTML(payload?.itemName ?? "Предмет");
+  const img = foundry.utils.escapeHTML(payload?.itemImg ?? "icons/svg/item-bag.svg");
+  const qty = Math.max(1, Number(payload?.quantity ?? 1) || 1);
+
+  const route = payload?.action === "delete"
+    ? `<strong>[ ${actorName} ]</strong>`
+    : `${actorName} <strong>→ [ ${targetName} ]</strong>`;
+
+  const heading = payload?.action === "delete"
+    ? `❌ <strong>Удаление предмета</strong>`
+    : `📦 <strong>Передача предмета</strong>`;
+
+  const content = `
+    <div class="pcga-item-audit">
+      ${heading}<br>
+      ${route}<br>
+      <div class="pcga-item-line">
+        <img src="${img}" alt="${itemName}">
+        <span>${itemName}${qty > 1 ? ` × <strong>${qty}</strong>` : ""}</span>
+      </div>
+      <strong>${success}</strong>
+    </div>`;
+
+  await ChatMessage.create({
+    content,
+    whisper: [game.user.id],
+    speaker: ChatMessage.getSpeaker()
+  });
+}
+
+
+
+async function createGMItemUseMessage(payload) {
+  if (!game.user.isGM) return;
+
+  const primaryGM = primaryActiveGM();
+  if (primaryGM && primaryGM.id !== game.user.id) return;
+
+  const actorName = foundry.utils.escapeHTML(payload?.actorName ?? "Игрок");
+  const itemName = foundry.utils.escapeHTML(payload?.itemName ?? "Предмет");
+  const img = foundry.utils.escapeHTML(payload?.itemImg ?? "icons/svg/item-bag.svg");
+
+  const content = `
+    <div class="pcga-item-audit">
+      ⚡ <strong>Использование предмета</strong><br>
+      <strong>[ ${actorName} ]</strong><br>
+      <div class="pcga-item-line">
+        <img src="${img}" alt="${itemName}">
+        <span>${itemName} × <strong>1</strong></span>
+      </div>
+      <strong>Успешно использовано ✓</strong>
+    </div>`;
+
+  await ChatMessage.create({
+    content,
+    whisper: [game.user.id],
+    speaker: ChatMessage.getSpeaker()
+  });
+}
+
+
+
+function pcgaOrderActorWallets() {
+  const reorder = root => {
+    if (!(root instanceof HTMLElement)) return;
+    if (root.classList.contains("currency-manager") || root.closest?.(".currency-manager")) return;
+
+    const currencyNodes = [...root.querySelectorAll("i.currency.cp, span.currency.cp")];
+    for (const cpIcon of currencyNodes) {
+      const cp = cpIcon.closest("label, li, .currency, .currency-item, .currency-entry") ?? cpIcon.parentElement;
+      if (!cp?.parentElement) continue;
+      const parent = cp.parentElement;
+
+      const siblings = [...parent.children];
+      const find = key => siblings.find(el => el.querySelector?.(`i.currency.${key}, span.currency.${key}`));
+      const sp = find("sp");
+      const gp = find("gp");
+      if (!sp || !gp || cp === sp || cp === gp || sp === gp) continue;
+
+      // Only act on a compact wallet row/container containing all three currencies.
+      parent.append(cp, sp, gp);
+    }
+  };
+
+  reorder(document.body);
+  const observer = new MutationObserver(ms => {
+    for (const m of ms) for (const n of m.addedNodes) {
+      if (n instanceof HTMLElement) reorder(n);
+    }
+  });
+  observer.observe(document.body, {childList: true, subtree: true});
+}
+
+Hooks.once("ready", () => {
+  pcgaOrderActorWallets();
+  pcgaInstallWalletContextMenu();
+  if (game.system.id !== "dnd5e") return;
+
+  const pcgaSocketHandler = async payload => {
+    try {
+      if (payload?.type === "audit") {
+        await createGMAuditMessage(payload);
+      } else if (payload?.type === "item-audit") {
+        await createGMItemAuditMessage(payload);
+      } else if (payload?.type === "remote-currency-request") {
+        await pcgaGMRemoteCurrency(payload);
+      } else if (payload?.type === "ims-item-use") {
+        await createGMItemUseMessage(payload);
+      }
+    } catch (err) {
+      console.error(`${MODULE_ID} | GM audit socket failed`, err);
+    }
+  };
+
+  game.socket.on(SOCKET, pcgaSocketHandler);
+  if (LEGACY_SOCKET !== SOCKET) game.socket.on(LEGACY_SOCKET, pcgaSocketHandler);
+
+  // The item menu delegates all successful transfer notifications to this
+  // module; never emit its own parallel/duplicate private chat messages.
+  Hooks.on("lipatosItemTransferCompleted", async result => {
+    if (game.user.isGM || !result?.ok) return;
+
+    const toGM = result.targetType === "gm";
+    const sourceActor = result.sourceActorUuid
+      ? await fromUuid(result.sourceActorUuid).catch(() => null) : null;
+    const destinations = toGM ? [] : [{name: result.targetName ?? "Получатель"}];
+
+    try {
+      if (["cp", "sp", "gp"].includes(result.coinCode)) {
+        const amounts = {[result.coinCode]: Math.max(1, Number(result.qty) || 1)};
+        sendAuditToGM(sourceActor ?? {name: result.sourceActorName}, destinations, amounts, {toGM});
+        await playerConfirmation(destinations, amounts, {toGM});
+      } else {
+        const payload = {
+          action: "transfer",
+          sourceActorUuid: result.sourceActorUuid,
+          sourceActorName: result.sourceActorName,
+          sourceActorType: result.sourceActorType,
+          targetActorName: result.targetName,
+          targetActorType: result.targetType,
+          itemName: result.itemName,
+          itemImg: result.itemImg,
+          quantity: result.qty
+        };
+        sendItemAuditToGM(payload);
+        await playerItemConfirmation(payload);
+      }
+    } catch (error) {
+      console.error(`${MODULE_ID} | Context transfer notification failed`, error);
+    }
+  });
+
+  const CurrencyManager = game.dnd5e?.applications?.CurrencyManager;
+  if (!CurrencyManager) {
+    console.error(`${MODULE_ID} | D&D5e CurrencyManager not found.`);
+    ui.notifications.warn("LipatoS - Аудит валюты и предметов: CurrencyManager не найден.");
+    return;
+  }
+
+  // Standard D&D5e transfers:
+  // - GM receives the old audit message
+  // - player receives a separate clean confirmation
+  if (!CurrencyManager.__pcgaTransferPatched) {
+    const originalTransfer = CurrencyManager.transferCurrency;
+
+    CurrencyManager.transferCurrency = async function(origin, destinations, amounts) {
+      const auditAmounts = Object.fromEntries(
+        Object.entries(amounts ?? {}).map(([key, value]) => [key, Number(value) || 0])
+      );
+
+      const auditDestinations = Array.isArray(destinations) ? [...destinations] : destinations;
+      const result = await originalTransfer.call(this, origin, destinations, amounts);
+
+      if (!game.user.isGM) {
+        try {
+          sendAuditToGM(origin, auditDestinations, auditAmounts);
+          await playerConfirmation(auditDestinations, auditAmounts);
+        } catch (err) {
+          console.error(`${MODULE_ID} | Could not create transfer messages`, err);
+        }
+      }
+
+      return result;
+    };
+
+    Object.defineProperty(CurrencyManager, "__pcgaTransferPatched", {value: true});
+  }
+
+  // Add "Передать ГМу" to the native transfer window.
+  if (!CurrencyManager.prototype.__pcgaRenderPatched) {
+    const originalRender = CurrencyManager.prototype._onRender;
+
+    CurrencyManager.prototype._onRender = async function(context, options) {
+      if (originalRender) await originalRender.call(this, context, options);
+      injectSendToGM(this);
+    };
+
+    Object.defineProperty(CurrencyManager.prototype, "__pcgaRenderPatched", {value: true});
+  }
+
+
+  // Native D&D5e consumption can delete an Item without custom document
+  // options. Track only Item IDs listed in confirmed consumption updates.
+  Hooks.on("dnd5e.activityConsumption", (activity, usage, message, updates) => {
+    const actor = activity?.actor;
+    for (const id of pcgaConsumptionDeletedIds(updates)) {
+      pcgaMarkConsumedItem(actor, id);
+    }
+  });
+
+  // The consumption batch has completed. Clear stale markers if some items
+  // were not actually destroyed (canceled or rejected by another module).
+  Hooks.on("dnd5e.postActivityConsumption", (activity, usage, message, updates) => {
+    for (const id of pcgaConsumptionDeletedIds(updates)) {
+      pcgaForgetConsumedItem(activity?.actor, id);
+    }
+  });
+
+  // Ammunition depleted by a confirmed attack is removed by the attack
+  // activity itself, outside the normal activity-consumption batch.
+  Hooks.on("dnd5e.rollAttack", (rolls, data) => {
+    if (!rolls?.length || !data?.ammoUpdate?.destroy) return;
+    pcgaMarkConsumedItem(data.subject?.actor, data.ammoUpdate.id);
+  });
+
+  // Track transfer destination when a new Item is created on another Actor.
+  Hooks.on("createItem", (item, options, userId) => {
+    if (options?.lipatosItemTransfer) return; // already reported through unified transfer event
+    rememberItemDestination(item, itemQuantity(item), userId);
+  });
+
+  // Track quantity changes.
+  // +delta = destination received part of a stack
+  // -delta = source gave part of a stack
+  Hooks.on("updateItem", async (item, changes, options, userId) => {
+    if (options?.lipatosItemTransfer) return;
+    if (game.user.isGM) return;
+    if (userId && userId !== game.user.id) return;
+    if (item?.parent?.documentName !== "Actor") return;
+
+    const changedQty = foundry.utils.getProperty(changes, "system.quantity");
+    if (changedQty === undefined) return;
+
+    const newQty = Number(changedQty);
+    const oldQty = Number(item._pcgaPreviousQuantity ?? NaN);
+    const delta = Number.isFinite(oldQty) ? (newQty - oldQty) : NaN;
+
+    if (!Number.isFinite(delta) || delta === 0) return;
+
+    // Destination side of a partial transfer / auto-stack.
+    if (delta > 0) {
+      rememberItemDestination(item, delta, userId);
+      return;
+    }
+
+    // Source side of a PARTIAL transfer.
+    // Pair it with the destination increase/create recorded moments earlier.
+    const movedQty = Math.abs(delta);
+    pruneItemDestinations();
+
+    const identity = itemIdentity(item);
+    let index = RECENT_ITEM_DESTINATIONS.findIndex(entry =>
+      entry.identity === identity &&
+      entry.targetActorUuid !== item.parent.uuid &&
+      entry.quantity === movedQty
+    );
+
+    if (index < 0) {
+      index = RECENT_ITEM_DESTINATIONS.findIndex(entry =>
+        entry.identity === identity &&
+        entry.targetActorUuid !== item.parent.uuid
+      );
+    }
+
+    if (index < 0) return; // ordinary manual quantity decrease: do not treat as transfer
+
+    const paired = RECENT_ITEM_DESTINATIONS.splice(index, 1)[0];
+
+    const payload = {
+      action: "transfer",
+      sourceActorUuid: item.parent.uuid,
+      sourceActorName: item.parent.name,
+      sourceActorType: item.parent.type,
+      targetActorUuid: paired.targetActorUuid,
+      targetActorName: paired.targetActorName,
+      targetActorType: paired.targetActorType,
+      itemName: item.name,
+      itemImg: item.img,
+      quantity: movedQty
+    };
+
+    try {
+      sendItemAuditToGM(payload);
+      await playerItemConfirmation(payload);
+    } catch (err) {
+      console.error(`${MODULE_ID} | Partial item transfer audit failed`, err);
+    }
+  });
+
+  // Capture quantity before update so updateItem can calculate the increase.
+  Hooks.on("preUpdateItem", (item, changes, options, userId) => {
+    if (options?.lipatosItemTransfer) return;
+    if (game.user.isGM) return;
+    if (userId && userId !== game.user.id) return;
+    const changedQty = foundry.utils.getProperty(changes, "system.quantity");
+    if (changedQty === undefined) return;
+    item._pcgaPreviousQuantity = itemQuantity(item);
+  });
+
+  Hooks.on("deleteItem", async (item, options, userId) => {
+    if (options?.lipatosItemTransfer) return; // actual transfer; not deletion
+    // Technical deletions are not "Удаление предмета" for audit purposes.
+    if (options?.itemMoveStackMerge) return;
+    if (pcgaIsConsumptionDeletion(item, options)) return;
+    // A physical coin moved from a container into the GP/SP/CP wallet is
+    // consumed as a bookkeeping step, not deleted by the player.
+    if (options?.lipatosCurrencyTransfer) return;
+
+    if (game.user.isGM) return;
+    if (userId && userId !== game.user.id) return;
+    if (item?.parent?.documentName !== "Actor") return;
+
+    const paired = takeMatchingDestination(item);
+
+    const payload = paired ? {
+      action: "transfer",
+      sourceActorUuid: item.parent.uuid,
+      sourceActorName: item.parent.name,
+      sourceActorType: item.parent.type,
+      targetActorUuid: paired.targetActorUuid,
+      targetActorName: paired.targetActorName,
+      targetActorType: paired.targetActorType,
+      itemName: item.name,
+      itemImg: item.img,
+      quantity: itemQuantity(item)
+    } : {
+      action: "delete",
+      sourceActorUuid: item.parent.uuid,
+      sourceActorName: item.parent.name,
+      sourceActorType: item.parent.type,
+      itemName: item.name,
+      itemImg: item.img,
+      quantity: itemQuantity(item)
+    };
+
+    if (!paired && payload.action === "delete") {
+      const key = `${item.parent.uuid}|${item.id}`;
+      const timer = setTimeout(async () => {
+        const pending = PENDING_ITEM_DELETIONS.get(key);
+        if (!pending) return;
+        PENDING_ITEM_DELETIONS.delete(key);
+        try {
+          sendItemAuditToGM(pending.payload);
+          await playerItemConfirmation(pending.payload);
+        } catch (err) {
+          console.error(`${MODULE_ID} | Delayed item audit failed`, err);
+        }
+      }, 1200);
+      PENDING_ITEM_DELETIONS.set(key, { payload, timer });
+      return;
+    }
+
+    try {
+      sendItemAuditToGM(payload);
+      await playerItemConfirmation(payload);
+    } catch (err) {
+      console.error(`${MODULE_ID} | Item audit failed`, err);
+    }
+  });
+
+  Hooks.on(ITEM_PILES_TRADE_HOOK, async (instigator, left, right, tradeId) => {
+    try {
+      const me=game.user.id;
+      const mine=left?.user===me?left:right?.user===me?right:null;
+      const other=mine===left?right:mine===right?left:null;
+      if(!mine||!other)return;
+
+      for(const entry of (mine.items??[])){
+        let id=entry.id??entry._id??"";
+        if(!id&&entry.uuid)id=String(entry.uuid).split(".").pop();
+        const key=`${mine.actor}|${id}`;
+        const pending=PENDING_ITEM_DELETIONS.get(key);
+        if(pending){clearTimeout(pending.timer);PENDING_ITEM_DELETIONS.delete(key);}
+      }
+
+      const normalize=async(entries=[])=>{
+        const rows=[];
+        for(const e of entries){
+          const qty=Math.max(1,Number(e.quantity??1)||1);
+          let doc=null;
+          if(e.uuid)doc=await fromUuid(e.uuid).catch(()=>null);
+          rows.push({name:e.name??doc?.name??"Предмет",img:e.img??doc?.img??"icons/svg/item-bag.svg",qty});
+        }
+        return rows;
+      };
+      const gave=await normalize(mine.items??[]);
+      const got=await normalize(other.items??[]);
+      const normalizeCurrencies=(entries=[])=>{
+        const out={gp:0,sp:0,cp:0};
+        for(const e of entries){
+          const text=`${e.name??""} ${e.path??""} ${e.abbreviation??""}`.toLowerCase();
+          const qty=Math.max(0,Number(e.quantity??e.qty??0)||0);
+          if(/золот|gold|\bgp\b/.test(text))out.gp+=qty;
+          else if(/сереб|silver|\bsp\b/.test(text))out.sp+=qty;
+          else if(/мед|copper|\bcp\b/.test(text))out.cp+=qty;
+        }
+        return out;
+      };
+      const gaveMoney=normalizeCurrencies(mine.currencies??mine.currency??[]);
+      const gotMoney=normalizeCurrencies(other.currencies??other.currency??[]);
+      const hasMoney=m=>m.gp||m.sp||m.cp;
+      if(!gave.length&&!got.length&&!hasMoney(gaveMoney)&&!hasMoney(gotMoney))return;
+
+      const section=(title,rows)=>rows.length?`<div class="pcga-trade-section"><strong>${title}</strong>${rows.map(r=>`<div class="pcga-item-line"><img src="${foundry.utils.escapeHTML(r.img)}" alt=""><span>${foundry.utils.escapeHTML(r.name)}${r.qty>1?` × <strong>${r.qty}</strong>`:""}</span></div>`).join("")}</div>`:"";
+      const moneyLine=m=>{
+        const parts=[];
+        if(m.gp)parts.push(`<strong>${m.gp}</strong> золота`);
+        if(m.sp)parts.push(`<strong>${m.sp}</strong> серебра`);
+        if(m.cp)parts.push(`<strong>${m.cp}</strong> меди`);
+        return parts.length?`<div class="pcga-trade-money">Монеты: ${parts.join(", ")}</div>`:"";
+      };
+      const side=(title,items,money)=>(items.length||hasMoney(money))?`<div class="pcga-trade-section"><strong>${title}</strong>${items.map(r=>`<div class="pcga-item-line"><img src="${foundry.utils.escapeHTML(r.img)}" alt=""><span>${foundry.utils.escapeHTML(r.name)}${r.qty>1?` × <strong>${r.qty}</strong>`:""}</span></div>`).join("")}${moneyLine(money)}</div>`:"";
+
+      const content=`<div class="pcga-item-audit pcga-trade-audit"><strong>⇄ Обмен</strong><br>${side("Вы отдали:",gave,gaveMoney)}${side("Вы получили:",got,gotMoney)}</div>`;
+      await ChatMessage.create({content,whisper:[game.user.id],speaker:ChatMessage.getSpeaker()});
+
+      const actor=await fromUuid(mine.actor).catch(()=>null);
+      sendItemAuditToGM({action:"trade-summary",sourceActorName:actor?.name??"Игрок",gave,got,gaveMoney,gotMoney});
+    }catch(err){console.error(`${MODULE_ID} | Item Piles trade audit failed`,err);}
+  });
+
+  console.log(`${MODULE_ID} | Ready v27.`);
+
+
+});

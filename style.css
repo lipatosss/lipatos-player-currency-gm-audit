@@ -1,0 +1,161 @@
+.currency-manager .pcga-send-gm {
+  margin-top: 6px;
+  width: 100%;
+}
+
+.pcga-chat-log {
+  line-height: 1.45;
+}
+
+.pcga-player-confirm {
+  line-height: 1.5;
+}
+
+.pcga-player-destination {
+  margin-bottom: 2px;
+}
+
+.pcga-player-destination strong {
+  font-weight: 700;
+}
+
+.pcga-player-amount {
+  margin-bottom: 5px;
+}
+
+.pcga-player-success {
+  font-weight: 700;
+}
+
+
+.pcga-item-audit {
+  line-height: 1.5;
+}
+
+.pcga-item-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 5px 0;
+}
+
+.pcga-item-line img {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border: 1px solid rgba(255,255,255,.25);
+  border-radius: 3px;
+}
+
+
+.currency-manager .pcga-send-player,
+.currency-manager .pcga-send-gm {
+  width: 100%;
+  margin-top: 6px;
+}
+.pcga-recipient-dialog {
+  min-width: 300px;
+}
+.pcga-recipient-dialog select {
+  width: 100%;
+}
+
+
+.currency-manager .pcga-choose-player {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.pcga-trade-section{margin-top:6px}
+.pcga-trade-section .pcga-item-line{margin-top:3px}
+
+.pcga-trade-money{margin-top:4px}
+
+
+/* The native currency-manager icon at the left of CP/SP/GP is replaced
+   by the wallet right-click action, without changing the coin fields. */
+dnd5e-inventory > section.currency > button[data-action="currency"] {
+  display: none !important;
+}
+
+/* Wallet right-click menu. Rendered outside actor sheets, so use solid
+   colors rather than inheriting native button/form theme styles. */
+.pcga-wallet-context-menu {
+  position: fixed;
+  z-index: 100000;
+  box-sizing: border-box;
+  min-width: 188px;
+  padding: 4px;
+  background: #201d20;
+  color: #efe4d0;
+  border: 1px solid #816b4a;
+  border-radius: 5px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .55);
+  font-family: var(--font-primary, "Signika", sans-serif);
+}
+
+.pcga-wallet-context-menu .pcga-wallet-context-item {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 3px;
+  background: #292429;
+  color: #efe4d0;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pcga-wallet-context-menu .pcga-wallet-context-item i {
+  color: #c3a373;
+  width: 15px;
+  flex: 0 0 15px;
+  text-align: center;
+}
+
+.pcga-wallet-context-menu .pcga-wallet-context-item:hover,
+.pcga-wallet-context-menu .pcga-wallet-context-item:focus-visible {
+  background: #403331;
+  color: #fff5df;
+  outline: 1px solid #a18456;
+  outline-offset: -1px;
+}
+
+.pcga-wallet-transfer-dialog { min-width: 320px; }
+.pcga-wallet-transfer-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.pcga-wallet-transfer-heading > i.currency {
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  background-size: contain;
+}
+.pcga-wallet-transfer-heading > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.pcga-wallet-transfer-heading > div span {
+  font-size: 12px;
+  opacity: .8;
+}
+.pcga-wallet-transfer-dialog select { width: 100%; }
+.pcga-wallet-transfer-quantity { display: flex; align-items: center; gap: 10px; }
+.pcga-wallet-transfer-quantity input[type="range"] { flex: 1; min-width: 120px; }
+.pcga-wallet-transfer-quantity input[type="number"] {
+  width: 80px;
+  flex: 0 0 80px;
+  text-align: center;
+}
