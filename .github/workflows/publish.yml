@@ -14,28 +14,60 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out main branch
+      - name: Check out main
         uses: actions/checkout@v4
         with:
           ref: main
-          persist-credentials: true
 
-      - name: Unpack module source into repository
+      - name: Extract, repair manifest and package flat installable ZIP
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/lipatos-module
-          unzip -oq lipatos-player-currency-gm-audit.zip -d /tmp/lipatos-module
-          cp /tmp/lipatos-module/lipatos-player-currency-gm-audit/{main.js,style.css,README.md,CHANGELOG.md,module.json} .
+          mkdir -p /tmp/lipatos-extracted
+          unzip -oq lipatos-player-currency-gm-audit.zip -d /tmp/lipatos-extracted
+          manifest_file=$(find /tmp/lipatos-extracted -type f -name module.json -not -path '*/__MACOSX/*' | head -n 1)
+          if [ -z "$manifest_file" ]; then
+            echo "Archive does not contain module.json" >&2
+            exit 1
+          fi
+          src=$(dirname "$manifest_file")
+          rsync -a --exclude='.git' --exclude='.github' --exclude='*.lock' "$src"/ ./
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          pkg = "lipatos-player-currency-gm-audit"
+          m = Path("module.json")
+          data = json.loads(m.read_text(encoding="utf-8"))
+          if data.get("id") != pkg:
+              raise SystemExit("Archive's module ID does not match the repository")
+          data["manifest"] = f"https://raw.githubusercontent.com/lipatosss/{pkg}/main/module.json"
+          data["download"] = f"https://github.com/lipatosss/{pkg}/releases/latest/download/{pkg}.zip"
+          m.write_text(json.dumps(data, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+          with ZipFile(pkg+".zip", "w", ZIP_DEFLATED) as output:
+              for file in sorted(Path(".").rglob("*")):
+                  if not file.is_file():
+                      continue
+                  if (".git" in file.parts or ".github" in file.parts or
+                      file.name == pkg+".zip" or file.name.endswith(".lock")):
+                      continue
+                  output.write(file, file.as_posix())
+          PY
+
+      - name: Commit source and installable archive
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add main.js style.css README.md CHANGELOG.md module.json
+          git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "Sync source files for Foundry module release"
+            git commit -m "Sync module source and normalized installable ZIP"
             git push origin HEAD:main
           fi
 
-      - name: Publish versioned GitHub release
+      - name: Create or update release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,7 +81,6 @@ jobs:
           else
             gh release create "${tag}" "${asset}" \
               --title "LipatoS — Аудит валюты и предметов ${tag}" \
-              --notes "Релиз модуля LipatoS для Foundry VTT. Установка через module.json в ветке main." \
-              --target main \
-              --latest
+              --notes "Установочный ZIP и манифест Foundry VTT." \
+              --target main --latest
           fi
